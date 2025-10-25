@@ -1,3 +1,4 @@
+mod with_smol;
 fn main() {
-    println!("Hello, world!");
+    with_smol::execute();
 }
