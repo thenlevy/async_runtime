@@ -24,6 +24,7 @@ impl Executor {
             self.task_queue.borrow_mut().receive();
 
             // Run all tasks that are ready to make progress.
+            println!("Running {} tasks", self.task_queue.borrow().len());
             loop {
                 let task = {
                     if let Some(task) = self.task_queue.borrow_mut().pop() {
@@ -43,6 +44,10 @@ impl Executor {
 
             //
             self.task_queue.borrow_mut().receive();
+            println!(
+                "After running tasks, {} tasks remain",
+                self.task_queue.borrow().len()
+            );
             if !self.reactor.borrow().waiting_on_events() && self.task_queue.borrow().is_empty() {
                 break;
             }

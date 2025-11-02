@@ -61,8 +61,11 @@ impl TcpConnectionAccept {
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
         println!("Polling TcpConnectionAccept in Start state");
 
+        let source = self.source.borrow();
         // SAFETY: The fd of self.source is a valid TCP listener fd.
-        let tcp_listener = unsafe { TcpListener::from_raw_fd(self.source.borrow().get_raw_fd()) };
+        let tcp_listener = unsafe { TcpListener::from_raw_fd(source.get_raw_fd()) };
+
+        std::mem::drop(source);
 
         let ret = tcp_listener.accept();
         println!("First accept attempt returned: {:?}", ret);
@@ -71,7 +74,7 @@ impl TcpConnectionAccept {
                 self.state = TcpConnectionAcceptState::FirstAttemptBlocked;
                 // Drop the TcpListener without closing the fd.
                 let _ = tcp_listener.into_raw_fd();
-                Poll::Pending
+                self.poll_first_attempt_blocked(cx)
             }
             res => {
                 // Drop the TcpListener without closing the fd.
@@ -85,16 +88,18 @@ impl TcpConnectionAccept {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
-        let mut currently_waiting_for = self.source.borrow().waiting_for();
-
         let source = self.source.borrow();
-        let fd = source.borrow_fd();
+        let mut currently_waiting_for = source.waiting_for();
 
         if !currently_waiting_for.readable {
+            println!("Registering interest in readability for TcpListener");
+            let fd = source.borrow_fd();
             currently_waiting_for.readable = true;
             self.reactor
                 .borrow_mut()
-                .register_interest(fd, currently_waiting_for);
+                .register_interest(fd, currently_waiting_for)
+                .unwrap();
+            std::mem::drop(source);
             self.source.borrow_mut().add_reader(cx.waker().clone());
         }
         self.state = TcpConnectionAcceptState::WokenWhenReady;
