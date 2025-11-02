@@ -7,13 +7,11 @@ use {
         borrow::Borrow,
         cell::{OnceCell, RefCell},
         collections::HashMap,
-        os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         rc::Rc,
         sync::{Arc, Mutex, OnceLock},
     },
 };
-
-static REACTOR: OnceLock<Arc<Mutex<Reactor>>> = OnceLock::new();
 
 pub struct Reactor {
     epoll_fd: OwnedFd,
