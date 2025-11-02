@@ -4,9 +4,10 @@ use {
     core::task::Waker,
     libc::epoll_ctl,
     std::{
+        borrow::Borrow,
         cell::RefCell,
         collections::HashMap,
-        os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         rc::Rc,
     },
 };
@@ -17,7 +18,7 @@ pub struct Reactor {
 }
 
 pub struct IoSource {
-    fd: RawFd,
+    fd: Rc<OwnedFd>,
     key: EventKey,
 
     // Wakers for tasks that are polling the readability or writability of this source.
@@ -77,24 +78,18 @@ impl Reactor {
         })
     }
 
-    /// You must ensure that:
-    /// - fd is valid and not closed while the returned IoSource is alive.
-    /// - You call deregister_source before fd is closed.
-    pub unsafe fn add_source(
-        &mut self,
-        fd: BorrowedFd<'_>,
-    ) -> std::io::Result<Rc<RefCell<IoSource>>> {
+    pub fn add_source(&mut self, fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
         let key = EventKey::new();
         let epoll_event: EpollEvent = Event::none(key).into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
 
         // SAFETY: self.epoll_fd is a valid epoll file descriptor created with epoll_create1.
-        // fd is a valid file descriptor as guaranteed by the BorrowedFd type.
+        // fd is a valid file descriptor as guaranteed by the OwnedFd type.
         let ret = unsafe {
             epoll_ctl(
                 self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_ADD,
-                fd.as_raw_fd(),
+                fd.as_ref().as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
             )
         };
@@ -103,7 +98,7 @@ impl Reactor {
             return Err(std::io::Error::last_os_error());
         }
         let new_source = Rc::new(RefCell::new(IoSource {
-            fd: fd.as_raw_fd(),
+            fd: fd,
             key,
             poll_reader: None,
             poll_writer: None,
@@ -155,14 +150,12 @@ impl Reactor {
                         }
                         let event = source.waiting_for();
                         if event.readable || event.writable {
-                            interests.push((source.fd, event));
+                            interests.push((source.fd.clone(), event));
                         }
                     }
                 }
                 for (fd, interest) in interests {
-                    // SAFETY: This is safe because we maintain the invariant that fd is valid while
-                    // the IoSource is alive.
-                    unsafe { self.register_interest(fd, interest) };
+                    self.register_interest(fd.as_fd(), interest).unwrap();
                 }
                 for waker in wakers {
                     waker.wake();
@@ -172,16 +165,21 @@ impl Reactor {
         }
     }
 
-    pub unsafe fn register_interest(&mut self, fd: RawFd, interest: Event) -> std::io::Result<()> {
+    pub fn register_interest(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        interest: Event,
+    ) -> std::io::Result<()> {
         let epoll_event: EpollEvent = interest.into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
 
         // SAFETY: self.epoll_fd is a valid epoll file descriptor created with epoll_create1.
+        // fd is a valid file descriptor as guaranteed by the BorrowedFd type.
         let ret = unsafe {
             epoll_ctl(
                 self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_MOD,
-                fd,
+                fd.as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
             )
         };
@@ -194,13 +192,14 @@ impl Reactor {
 
     pub fn deregister_source(&mut self, key: &EventKey) -> std::io::Result<()> {
         if let Some(source_rc) = self.sources.remove(key) {
-            let source = source_rc.borrow();
+            let source = source_rc.as_ref().borrow();
             // SAFETY: self.epoll_fd is a valid epoll file descriptor created with epoll_create1.
+            // the source.fd is valid as long as the IoSource is alive.
             let ret = unsafe {
                 epoll_ctl(
                     self.epoll_fd.as_raw_fd(),
                     libc::EPOLL_CTL_DEL,
-                    source.fd,
+                    source.fd.as_ref().as_raw_fd(),
                     std::ptr::null_mut(),
                 )
             };
@@ -214,7 +213,7 @@ impl Reactor {
 
     pub fn waiting_on_events(&self) -> bool {
         self.sources.values().any(|source_rc| {
-            let source = source_rc.borrow();
+            let source = source_rc.as_ref().borrow();
             let event = source.waiting_for();
             event.readable || event.writable
         })
