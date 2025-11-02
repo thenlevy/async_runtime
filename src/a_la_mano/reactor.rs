@@ -5,12 +5,15 @@ use {
     libc::epoll_ctl,
     std::{
         borrow::Borrow,
-        cell::RefCell,
+        cell::{OnceCell, RefCell},
         collections::HashMap,
         os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         rc::Rc,
+        sync::{Arc, Mutex, OnceLock},
     },
 };
+
+static REACTOR: OnceLock<Arc<Mutex<Reactor>>> = OnceLock::new();
 
 pub struct Reactor {
     epoll_fd: OwnedFd,
@@ -31,6 +34,10 @@ pub struct IoSource {
 }
 
 impl IoSource {
+    pub fn get_raw_fd(&self) -> RawFd {
+        self.fd.as_ref().as_raw_fd()
+    }
+
     fn drain_writers_into(&mut self, wakers: &mut Vec<Waker>) {
         if let Some(waker) = self.poll_writer.take() {
             wakers.push(waker);
@@ -45,7 +52,7 @@ impl IoSource {
         wakers.extend(self.readers.drain(..));
     }
 
-    fn waiting_for(&self) -> Event {
+    pub fn waiting_for(&self) -> Event {
         let mut event = Event::none(self.key);
         if self.poll_reader.is_some() || !self.readers.is_empty() {
             event.readable = true;
@@ -54,6 +61,14 @@ impl IoSource {
             event.writable = true;
         }
         event
+    }
+
+    pub fn borrow_fd<'a>(&'a self) -> BorrowedFd<'a> {
+        self.fd.as_fd()
+    }
+
+    pub fn add_reader(&mut self, waker: Waker) {
+        self.readers.push(waker);
     }
 }
 
@@ -232,8 +247,8 @@ impl EventKey {
 }
 pub struct Event {
     key: EventKey,
-    readable: bool,
-    writable: bool,
+    pub readable: bool,
+    pub writable: bool,
 }
 
 impl Event {
