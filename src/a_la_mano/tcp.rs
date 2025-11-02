@@ -100,8 +100,8 @@ impl TcpConnectionAccept {
                 .register_interest(fd, currently_waiting_for)
                 .unwrap();
             std::mem::drop(source);
-            self.source.borrow_mut().add_reader(cx.waker().clone());
         }
+        self.source.borrow_mut().add_reader(cx.waker().clone());
         self.state = TcpConnectionAcceptState::WokenWhenReady;
         Poll::Pending
     }

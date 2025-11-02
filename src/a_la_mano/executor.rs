@@ -173,6 +173,7 @@ impl MyWaker {
     }
 
     unsafe fn wake(ptr: *const ()) {
+        println!("Waker is waking a task");
         let waker = unsafe {
             // SAFETY:
             // * `ptr` was created either from MyWaker::new or MyWaker::clone. In both cases,

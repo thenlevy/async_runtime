@@ -147,19 +147,20 @@ impl Reactor {
             Err(e) => Err(e),
             Ok(nb_events) => {
                 assert!(nb_events >= 0);
-                let wakers = Vec::with_capacity(nb_events as usize);
+                let mut wakers = Vec::with_capacity(nb_events as usize);
                 let events = &events[0..nb_events as usize];
                 for event in events {
                     let epoll_event = EpollEvent::from(*event);
                     let event = Event::from(epoll_event);
+                    println!("got event {event:?}");
 
                     if let Some(mut source) = self.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
                         if event.readable {
-                            source.drain_readers_into(&mut wakers.clone());
+                            source.drain_readers_into(&mut wakers);
                         }
                         if event.writable {
-                            source.drain_writers_into(&mut wakers.clone());
+                            source.drain_writers_into(&mut wakers);
                         }
                         let event = source.waiting_for();
                         if event.readable || event.writable {
@@ -170,6 +171,7 @@ impl Reactor {
                 for (fd, interest) in interests {
                     self.register_interest(fd.as_fd(), interest).unwrap();
                 }
+                println!("Waking {} tasks", wakers.len());
                 for waker in wakers {
                     waker.wake();
                 }
@@ -233,7 +235,7 @@ impl Reactor {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventKey(u64);
 
 impl EventKey {
@@ -243,6 +245,7 @@ impl EventKey {
         Self(NEXT_KEY.fetch_add(1, Ordering::Relaxed))
     }
 }
+#[derive(Debug)]
 pub struct Event {
     key: EventKey,
     pub readable: bool,
