@@ -3,7 +3,6 @@ use {
     futures::future::Either,
     smol::{
         Timer,
-        future::FutureExt,
         io::{AsyncBufReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     },

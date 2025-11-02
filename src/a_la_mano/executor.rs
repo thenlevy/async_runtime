@@ -1,6 +1,9 @@
 //! https://redixhumayun.github.io/async/2024/10/10/async-runtimes-part-iii.html
+
+use crate::a_la_mano::reactor::{Event, Reactor};
+
 use {
-    core::task::{RawWaker, RawWakerVTable, Waker},
+    core::task::{Context, RawWaker, RawWakerVTable, Waker},
     std::{
         cell::RefCell,
         pin::Pin,
@@ -12,12 +15,15 @@ use {
 struct Executor {
     task_queue: Rc<RefCell<TaskQueue>>,
     next_task_id: usize,
+    reactor: Rc<RefCell<Reactor>>,
 }
 
 impl Executor {
     fn run(&self) {
         loop {
             self.task_queue.borrow_mut().receive();
+
+            // Run all tasks that are ready to make progress.
             loop {
                 let task = {
                     if let Some(task) = self.task_queue.borrow_mut().pop() {
@@ -35,14 +41,15 @@ impl Executor {
                 };
             }
 
+            //
             self.task_queue.borrow_mut().receive();
             if !self.reactor.borrow().waiting_on_events() && self.task_queue.borrow().is_empty() {
                 break;
             }
 
             if self.reactor.borrow().waiting_on_events() {
-                match self.wait_for_io() {
-                    Ok(events) => self.wake_futures_on_io(events),
+                match self.reactor.borrow_mut().react() {
+                    Ok(()) => {}
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::Interrupted {
                             break;
@@ -52,18 +59,6 @@ impl Executor {
                 }
             }
         }
-    }
-
-    fn wait_for_io(&self) -> std::io::Result<Vec<Event>> {
-        self.reactor.borrow_mut().poll()
-    }
-
-    fn wake_futures_on_io(&self, events: Vec<Event>) {
-        let wakers = self.reactor.borrow_mut().get_wakers(events);
-        let _ = wakers
-            .into_iter()
-            .map(|waker| waker.wake())
-            .collect::<Vec<_>>();
     }
 }
 
@@ -112,7 +107,9 @@ pub struct Task {
 }
 
 pub struct MyWaker {
+    /// The task whose executions is to be resumed when `wake` or `wake_by_ref` is called.
     task: Rc<Task>,
+    /// By sending the task through this sender, we enqueue it back into the executor's task queue.
     sender: Sender<Rc<Task>>,
 }
 
@@ -123,7 +120,10 @@ impl MyWaker {
     pub fn new(task: Rc<Task>, sender: Sender<Rc<Task>>) -> Waker {
         let pointer = Rc::into_raw(Rc::new(MyWaker { task, sender })) as *const ();
         let vtable = &MyWaker::VTABLE;
-        unsafe { Waker::from_raw(RawWaker::new(pointer, vtable)) }
+
+        // SAFETY: In the context of this project, it's okay to create a Waker with a non-thread
+        // safe interface because we won't be spawning threads.
+        unsafe { Waker::new(pointer, vtable) }
     }
 
     unsafe fn clone(ptr: *const ()) -> RawWaker {
