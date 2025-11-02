@@ -38,7 +38,7 @@ impl AsyncTcpListener {
     }
 }
 
-struct TcpConnectionAccept {
+pub struct TcpConnectionAccept {
     source: Rc<RefCell<IoSource>>,
     state: TcpConnectionAcceptState,
     reactor: Rc<RefCell<Reactor>>,
@@ -59,12 +59,18 @@ impl TcpConnectionAccept {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
+        println!("Polling TcpConnectionAccept in Start state");
+
         // SAFETY: The fd of self.source is a valid TCP listener fd.
         let tcp_listener = unsafe { TcpListener::from_raw_fd(self.source.borrow().get_raw_fd()) };
 
-        match tcp_listener.accept() {
+        let ret = tcp_listener.accept();
+        println!("First accept attempt returned: {:?}", ret);
+        match ret {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.state = TcpConnectionAcceptState::FirstAttemptBlocked;
+                // Drop the TcpListener without closing the fd.
+                let _ = tcp_listener.into_raw_fd();
                 Poll::Pending
             }
             res => {

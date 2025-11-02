@@ -73,7 +73,7 @@ impl IoSource {
 impl Reactor {
     const MAX_EVENT: u32 = 1024;
 
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         let epoll_fd = unsafe {
             // SAFETY: epoll_create1 with is always safe to call with a flag of 0.
             let raw_fd = libc::epoll_create1(0);

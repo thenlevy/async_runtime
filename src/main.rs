@@ -2,5 +2,6 @@ mod a_la_mano;
 mod with_smol;
 
 fn main() {
-    with_smol::execute();
+    //with_smol::execute();
+    a_la_mano::start();
 }

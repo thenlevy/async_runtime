@@ -12,14 +12,14 @@ use {
     },
 };
 
-struct Executor {
+pub struct Executor {
     task_queue: Rc<RefCell<TaskQueue>>,
     next_task_id: usize,
-    reactor: Rc<RefCell<Reactor>>,
+    pub reactor: Rc<RefCell<Reactor>>,
 }
 
 impl Executor {
-    fn run(&self) {
+    pub fn run(&self) {
         loop {
             self.task_queue.borrow_mut().receive();
 
@@ -58,6 +58,30 @@ impl Executor {
                     }
                 }
             }
+        }
+    }
+
+    pub fn block_on<F>(&mut self, future: F)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+    {
+        let task = Rc::new(Task {
+            id: self.next_task_id,
+            future: RefCell::new(Box::pin(future)),
+        });
+        self.next_task_id += 1;
+        self.task_queue.borrow().sender().send(task).unwrap();
+        self.run();
+    }
+
+    pub fn new() -> Self {
+        let reactor = Rc::new(RefCell::new(
+            Reactor::new().expect("Failed to create reactor"),
+        ));
+        Self {
+            task_queue: Rc::new(RefCell::new(TaskQueue::new())),
+            next_task_id: 0,
+            reactor,
         }
     }
 }

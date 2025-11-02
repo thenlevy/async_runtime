@@ -2,26 +2,26 @@ mod executor;
 mod reactor;
 mod tcp;
 
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{cell::RefCell, rc::Rc};
 
-struct Timer {
-    fires_at: Instant,
+async fn run(reactor: Rc<RefCell<reactor::Reactor>>) {
+    let tcp_listener = tcp::AsyncTcpListener::bind("127.0.0.1:8080", reactor.clone())
+        .expect("Failed to bind TCP listener");
+
+    loop {
+        println!("Waiting for incoming TCP connections...");
+        let (tcp_stream, _addr) = tcp_listener
+            .accept()
+            .await
+            .expect("Failed to accept TCP connection");
+
+        println!("Accepted connection from {:?}", tcp_stream.peer_addr());
+
+        // Handle the TCP connection (e.g., read/write data) here.
+    }
 }
 
-impl Future for Timer {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if Instant::now() >= self.fires_at {
-            Poll::Ready(())
-        } else {
-            // Pending, but we must promise to call cx.waker().wake() when the timer would fire.
-            Poll::Pending
-        }
-    }
+pub fn start() {
+    let mut executor = executor::Executor::new();
+    executor.block_on(run(executor.reactor.clone()));
 }
