@@ -5,7 +5,7 @@ use std::{
     io::Read,
     marker::Unpin,
     net::{SocketAddr, TcpListener, TcpStream},
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -38,10 +38,6 @@ const BUF_SIZE: usize = 4096;
 pub struct AsyncTcpStream {
     _inner: Rc<OwnedFd>,
     source: Rc<RefCell<IoSource>>,
-    buf: Box<[u8; BUF_SIZE]>,
-    pos: usize,
-    cap: usize,
-    next_line: Vec<u8>,
 }
 
 impl Unpin for AsyncTcpStream {}
@@ -53,18 +49,33 @@ impl AsyncTcpStream {
         let fd = Rc::new(OwnedFd::from(stream));
         let source = Reactor::add_source(fd.clone())?;
         dbg!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
-        Ok(Self {
-            _inner: fd,
-            source,
+        Ok(Self { _inner: fd, source })
+    }
+
+    pub fn get_line(&self) -> impl Future<Output = std::io::Result<Option<String>>> {
+        NextTcpStreamLine::new(self)
+    }
+}
+
+struct NextTcpStreamLine<'a> {
+    inner: BorrowedFd<'a>,
+    source: Rc<RefCell<IoSource>>,
+    buf: Box<[u8; BUF_SIZE]>,
+    pos: usize,
+    cap: usize,
+    next_line: Vec<u8>,
+}
+
+impl<'a> NextTcpStreamLine<'a> {
+    fn new(stream: &'a AsyncTcpStream) -> Self {
+        Self {
+            inner: stream._inner.as_ref().as_fd(),
+            source: stream.source.clone(),
             buf: Box::new([0; BUF_SIZE]),
             pos: 0,
             cap: 0,
             next_line: Vec::new(),
-        })
-    }
-
-    pub fn get_line(&mut self) -> impl Future<Output = std::io::Result<Option<String>>> {
-        NextTcpStreamLine { stream: self }
+        }
     }
 
     fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<String>>> {
@@ -128,16 +139,12 @@ impl AsyncTcpStream {
     }
 }
 
-struct NextTcpStreamLine<'a> {
-    stream: &'a mut AsyncTcpStream,
-}
-
 impl<'a> Future for NextTcpStreamLine<'a> {
     type Output = std::io::Result<Option<String>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = Pin::get_mut(self);
-        this.stream.poll_line(cx)
+        this.poll_line(cx)
     }
 }
 
