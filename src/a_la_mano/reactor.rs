@@ -6,7 +6,10 @@ use {
     std::{
         cell::RefCell,
         collections::HashMap,
-        os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        os::{
+            fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+            unix::net::UnixStream,
+        },
         rc::Rc,
         sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
@@ -16,7 +19,8 @@ static HANDLE: AtomicPtr<Reactor> = AtomicPtr::new(core::ptr::null_mut());
 pub struct Reactor {
     epoll_fd: OwnedFd,
     sources: HashMap<EventKey, Rc<RefCell<IoSource>>>,
-    tick: AtomicUsize,
+    notify_stream: UnixStream,
+    notify_event_key: Option<EventKey>,
 }
 
 pub struct IoSource {
@@ -96,15 +100,34 @@ impl Reactor {
             OwnedFd::from_raw_fd(raw_fd)
         };
 
-        Ok(Self {
+        let (listener, sender) = UnixStream::pair()?;
+        let mut ret = Self {
             epoll_fd,
             sources: HashMap::new(),
-            tick: AtomicUsize::new(0),
-        })
+            notify_stream: sender,
+            notify_event_key: None,
+        };
+
+        let source = ret.add_source_inner(Rc::new(OwnedFd::from(listener)))?;
+        let mut interest = source.borrow().waiting_for();
+        interest.readable = true;
+        ret.notify_event_key = Some(interest.key);
+        ret.register_interest_inner(source.borrow().borrow_fd(), interest)?;
+
+        Ok(ret)
+    }
+
+    pub fn notify() -> std::io::Result<()> {
+        use std::io::Write;
+        Self::get().notify_stream.write(&[1]).map(|_| ())
     }
 
     pub fn add_source(fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
         let this = Self::get();
+        this.add_source_inner(fd)
+    }
+
+    fn add_source_inner(&mut self, fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
         let key = EventKey::new();
         let epoll_event: EpollEvent = Event::none(key).into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
@@ -113,7 +136,7 @@ impl Reactor {
         // fd is a valid file descriptor as guaranteed by the OwnedFd type.
         let ret = unsafe {
             epoll_ctl(
-                this.epoll_fd.as_raw_fd(),
+                self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_ADD,
                 fd.as_ref().as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
@@ -129,7 +152,7 @@ impl Reactor {
             readers: Vec::new(),
             writers: Vec::new(),
         }));
-        this.sources.insert(key, new_source.clone());
+        self.sources.insert(key, new_source.clone());
         Ok(new_source)
     }
 
@@ -187,13 +210,40 @@ impl Reactor {
                 for waker in wakers {
                     waker.wake();
                 }
+
+                // Clear the spawn notifications
+                {
+                    let notify_event_key = this
+                        .notify_event_key
+                        .expect("notify event key was set at initialisation");
+                    let notify_source = this
+                        .sources
+                        .get(&notify_event_key)
+                        .expect("Notify source was registered at initialisation");
+                    {
+                        use std::{io::Read, os::fd::IntoRawFd};
+                        let mut stream =
+                            unsafe { UnixStream::from_raw_fd(notify_source.borrow().get_raw_fd()) };
+                        stream.set_nonblocking(true)?;
+                        let mut buf = [0; 1024];
+                        while let Ok(_) = stream.read(&mut buf.as_mut_slice()) {}
+                        let _ = stream.into_raw_fd();
+                    }
+                    this.register_interest_inner(
+                        notify_source.borrow().borrow_fd(),
+                        Event {
+                            key: notify_event_key,
+                            readable: true,
+                            writable: false,
+                        },
+                    )?;
+                }
                 Ok(())
             }
         }
     }
 
-    pub fn register_interest(fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
-        let this = Self::get();
+    fn register_interest_inner(&self, fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
         let epoll_event: EpollEvent = interest.into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
 
@@ -201,7 +251,7 @@ impl Reactor {
         // fd is a valid file descriptor as guaranteed by the BorrowedFd type.
         let ret = unsafe {
             epoll_ctl(
-                this.epoll_fd.as_raw_fd(),
+                self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_MOD,
                 fd.as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
@@ -212,6 +262,11 @@ impl Reactor {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    pub fn register_interest(fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
+        let this = Self::get();
+        this.register_interest_inner(fd, interest)
     }
 
     pub fn deregister_source(&mut self, key: &EventKey) -> std::io::Result<()> {

@@ -92,6 +92,7 @@ impl Executor {
         });
         this.next_task_id.update(|x| x + 1);
         this.task_queue.borrow().sender().send(task).unwrap();
+        Reactor::notify();
     }
 
     pub fn block_on<F>(future: F)
