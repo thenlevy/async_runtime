@@ -1,25 +1,40 @@
 //! https://redixhumayun.github.io/async/2024/10/10/async-runtimes-part-iii.html
 
-use crate::a_la_mano::reactor::{Event, Reactor};
+use crate::a_la_mano::reactor::Reactor;
 
 use {
     core::task::{Context, RawWaker, RawWakerVTable, Waker},
     std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         pin::Pin,
         rc::Rc,
-        sync::mpsc::{self, Receiver, Sender},
+        sync::{
+            atomic::{AtomicPtr, Ordering},
+            mpsc::{self, Receiver, Sender},
+        },
     },
 };
 
 pub struct Executor {
     task_queue: Rc<RefCell<TaskQueue>>,
-    next_task_id: usize,
-    pub reactor: Rc<RefCell<Reactor>>,
+    next_task_id: Cell<usize>,
 }
 
+static HANDLE: AtomicPtr<Executor> = AtomicPtr::new(core::ptr::null_mut());
+
 impl Executor {
-    pub fn run(&self) {
+    fn get() -> &'static Self {
+        let p = HANDLE.load(Ordering::Relaxed);
+        if p.is_null() {
+            let p = Box::new(Executor::new());
+            HANDLE.store(Box::leak(p) as *mut Executor, Ordering::Relaxed);
+            Executor::get()
+        } else {
+            unsafe { p.as_ref().unwrap_unchecked() }
+        }
+    }
+
+    fn run(&self) {
         loop {
             self.task_queue.borrow_mut().receive();
 
@@ -42,18 +57,18 @@ impl Executor {
                 };
             }
 
-            //
+            println!("Recieving tasks");
             self.task_queue.borrow_mut().receive();
             println!(
                 "After running tasks, {} tasks remain",
                 self.task_queue.borrow().len()
             );
-            if !self.reactor.borrow().waiting_on_events() && self.task_queue.borrow().is_empty() {
+            if !Reactor::waiting_on_events() && self.task_queue.borrow().is_empty() {
                 break;
             }
 
-            if self.reactor.borrow().waiting_on_events() {
-                match self.reactor.borrow_mut().react() {
+            if Reactor::waiting_on_events() {
+                match Reactor::react() {
                     Ok(()) => {}
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::Interrupted {
@@ -66,27 +81,37 @@ impl Executor {
         }
     }
 
-    pub fn block_on<F>(&mut self, future: F)
+    pub fn spawn<F>(future: F)
     where
         F: std::future::Future<Output = ()> + 'static,
     {
+        let this = Self::get();
         let task = Rc::new(Task {
-            id: self.next_task_id,
+            id: this.next_task_id.get(),
             future: RefCell::new(Box::pin(future)),
         });
-        self.next_task_id += 1;
-        self.task_queue.borrow().sender().send(task).unwrap();
-        self.run();
+        this.next_task_id.update(|x| x + 1);
+        this.task_queue.borrow().sender().send(task).unwrap();
+    }
+
+    pub fn block_on<F>(future: F)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+    {
+        let this = Self::get();
+        let task = Rc::new(Task {
+            id: this.next_task_id.get(),
+            future: RefCell::new(Box::pin(future)),
+        });
+        this.next_task_id.update(|x| x + 1);
+        this.task_queue.borrow().sender().send(task).unwrap();
+        this.run();
     }
 
     pub fn new() -> Self {
-        let reactor = Rc::new(RefCell::new(
-            Reactor::new().expect("Failed to create reactor"),
-        ));
         Self {
             task_queue: Rc::new(RefCell::new(TaskQueue::new())),
-            next_task_id: 0,
-            reactor,
+            next_task_id: Cell::new(0),
         }
     }
 }

@@ -4,28 +4,24 @@ use {
     core::task::Waker,
     libc::epoll_ctl,
     std::{
-        borrow::Borrow,
-        cell::{OnceCell, RefCell},
+        cell::RefCell,
         collections::HashMap,
         os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         rc::Rc,
-        sync::{Arc, Mutex, OnceLock},
+        sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
+static HANDLE: AtomicPtr<Reactor> = AtomicPtr::new(core::ptr::null_mut());
 pub struct Reactor {
     epoll_fd: OwnedFd,
     sources: HashMap<EventKey, Rc<RefCell<IoSource>>>,
+    tick: AtomicUsize,
 }
 
 pub struct IoSource {
     fd: Rc<OwnedFd>,
     key: EventKey,
-
-    // Wakers for tasks that are polling the readability or writability of this source.
-    poll_reader: Option<Waker>,
-    poll_writer: Option<Waker>,
-
     // Wakers for tasks that are waiting for this source to be readable or writable.
     readers: Vec<Waker>,
     writers: Vec<Waker>,
@@ -37,25 +33,19 @@ impl IoSource {
     }
 
     fn drain_writers_into(&mut self, wakers: &mut Vec<Waker>) {
-        if let Some(waker) = self.poll_writer.take() {
-            wakers.push(waker);
-        }
         wakers.extend(self.writers.drain(..));
     }
 
     fn drain_readers_into(&mut self, wakers: &mut Vec<Waker>) {
-        if let Some(waker) = self.poll_reader.take() {
-            wakers.push(waker);
-        }
         wakers.extend(self.readers.drain(..));
     }
 
     pub fn waiting_for(&self) -> Event {
         let mut event = Event::none(self.key);
-        if self.poll_reader.is_some() || !self.readers.is_empty() {
+        if !self.readers.is_empty() {
             event.readable = true;
         }
-        if self.poll_writer.is_some() || !self.writers.is_empty() {
+        if !self.writers.is_empty() {
             event.writable = true;
         }
         event
@@ -65,13 +55,34 @@ impl IoSource {
         self.fd.as_fd()
     }
 
-    pub fn add_reader(&mut self, waker: Waker) {
+    pub fn add_reader(&mut self, waker: Waker) -> std::io::Result<()> {
+        if self.readers.is_empty() {
+            println!("fd: {}, self.readers was empty", self.get_raw_fd());
+            let mut event = self.waiting_for();
+            event.readable = true;
+            Reactor::register_interest(self.borrow_fd(), event)?;
+        }
         self.readers.push(waker);
+        Ok(())
     }
 }
 
 impl Reactor {
     const MAX_EVENT: u32 = 1024;
+
+    fn get() -> &'static mut Self {
+        let p = HANDLE.load(Ordering::Relaxed);
+        if p.is_null() {
+            HANDLE.store(
+                Box::leak(Box::new(Reactor::new().expect("Could not create reactor")))
+                    as *mut Reactor,
+                Ordering::Relaxed,
+            );
+            Self::get()
+        } else {
+            unsafe { HANDLE.load(Ordering::Relaxed).as_mut().unwrap_unchecked() }
+        }
+    }
 
     pub fn new() -> std::io::Result<Self> {
         let epoll_fd = unsafe {
@@ -88,10 +99,12 @@ impl Reactor {
         Ok(Self {
             epoll_fd,
             sources: HashMap::new(),
+            tick: AtomicUsize::new(0),
         })
     }
 
-    pub fn add_source(&mut self, fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
+    pub fn add_source(fd: Rc<OwnedFd>) -> std::io::Result<Rc<RefCell<IoSource>>> {
+        let this = Self::get();
         let key = EventKey::new();
         let epoll_event: EpollEvent = Event::none(key).into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
@@ -100,7 +113,7 @@ impl Reactor {
         // fd is a valid file descriptor as guaranteed by the OwnedFd type.
         let ret = unsafe {
             epoll_ctl(
-                self.epoll_fd.as_raw_fd(),
+                this.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_ADD,
                 fd.as_ref().as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
@@ -113,23 +126,22 @@ impl Reactor {
         let new_source = Rc::new(RefCell::new(IoSource {
             fd: fd,
             key,
-            poll_reader: None,
-            poll_writer: None,
             readers: Vec::new(),
             writers: Vec::new(),
         }));
-        self.sources.insert(key, new_source.clone());
+        this.sources.insert(key, new_source.clone());
         Ok(new_source)
     }
 
-    pub fn react(&mut self) -> std::io::Result<()> {
+    pub fn react() -> std::io::Result<()> {
+        let this = Self::get();
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
         let mut interests = Vec::new();
 
         let res = {
             let nb_events = unsafe {
                 libc::epoll_wait(
-                    self.epoll_fd.as_raw_fd(),
+                    this.epoll_fd.as_raw_fd(),
                     events.as_mut_ptr(),
                     Self::MAX_EVENT as i32,
                     -1,
@@ -154,7 +166,7 @@ impl Reactor {
                     let event = Event::from(epoll_event);
                     println!("got event {event:?}");
 
-                    if let Some(mut source) = self.sources.get(&event.key).map(|rc| rc.borrow_mut())
+                    if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
                         if event.readable {
                             source.drain_readers_into(&mut wakers);
@@ -169,7 +181,7 @@ impl Reactor {
                     }
                 }
                 for (fd, interest) in interests {
-                    self.register_interest(fd.as_fd(), interest).unwrap();
+                    Self::register_interest(fd.as_fd(), interest).unwrap();
                 }
                 println!("Waking {} tasks", wakers.len());
                 for waker in wakers {
@@ -180,11 +192,8 @@ impl Reactor {
         }
     }
 
-    pub fn register_interest(
-        &mut self,
-        fd: BorrowedFd<'_>,
-        interest: Event,
-    ) -> std::io::Result<()> {
+    pub fn register_interest(fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
+        let this = Self::get();
         let epoll_event: EpollEvent = interest.into();
         let mut libc_epoll_event: libc::epoll_event = epoll_event.into();
 
@@ -192,7 +201,7 @@ impl Reactor {
         // fd is a valid file descriptor as guaranteed by the BorrowedFd type.
         let ret = unsafe {
             epoll_ctl(
-                self.epoll_fd.as_raw_fd(),
+                this.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_MOD,
                 fd.as_raw_fd(),
                 (&mut libc_epoll_event) as *mut libc::epoll_event,
@@ -226,8 +235,9 @@ impl Reactor {
         Ok(())
     }
 
-    pub fn waiting_on_events(&self) -> bool {
-        self.sources.values().any(|source_rc| {
+    pub fn waiting_on_events() -> bool {
+        let this = Self::get();
+        this.sources.values().any(|source_rc| {
             let source = source_rc.as_ref().borrow();
             let event = source.waiting_for();
             event.readable || event.writable

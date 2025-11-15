@@ -2,6 +2,7 @@ use crate::a_la_mano::reactor::{IoSource, Reactor};
 
 use std::{
     cell::RefCell,
+    io::Read,
     marker::Unpin,
     net::{SocketAddr, TcpListener, TcpStream},
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
@@ -11,37 +12,137 @@ use std::{
 };
 
 pub struct AsyncTcpListener {
-    inner: Rc<OwnedFd>,
+    _inner: Rc<OwnedFd>,
     source: Rc<RefCell<IoSource>>,
-    reactor: Rc<RefCell<Reactor>>,
 }
 
 impl AsyncTcpListener {
-    pub fn bind(addr: &str, reactor: Rc<RefCell<Reactor>>) -> std::io::Result<Self> {
+    pub fn bind(addr: &str) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let fd = Rc::new(OwnedFd::from(listener));
-        let source = reactor.borrow_mut().add_source(fd.clone())?;
-        Ok(Self {
-            inner: fd,
-            source,
-            reactor,
-        })
+        let source = Reactor::add_source(fd.clone())?;
+        Ok(Self { _inner: fd, source })
     }
 
     pub fn accept(&self) -> TcpConnectionAccept {
         TcpConnectionAccept {
             state: TcpConnectionAcceptState::Start,
             source: self.source.clone(),
-            reactor: self.reactor.clone(),
         }
+    }
+}
+
+const BUF_SIZE: usize = 4096;
+
+pub struct AsyncTcpStream {
+    _inner: Rc<OwnedFd>,
+    source: Rc<RefCell<IoSource>>,
+    buf: Box<[u8; BUF_SIZE]>,
+    pos: usize,
+    cap: usize,
+    next_line: Vec<u8>,
+}
+
+impl Unpin for AsyncTcpStream {}
+
+impl AsyncTcpStream {
+    pub fn from_tcp_stream(stream: TcpStream) -> std::io::Result<Self> {
+        stream.set_nonblocking(true)?;
+
+        let fd = Rc::new(OwnedFd::from(stream));
+        let source = Reactor::add_source(fd.clone())?;
+        println!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
+        Ok(Self {
+            _inner: fd,
+            source,
+            buf: Box::new([0; BUF_SIZE]),
+            pos: 0,
+            cap: 0,
+            next_line: Vec::new(),
+        })
+    }
+
+    pub fn get_line(&mut self) -> impl Future<Output = std::io::Result<Option<String>>> {
+        NextTcpStreamLine { stream: self }
+    }
+
+    fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<String>>> {
+        loop {
+            // If we have consumed all the bytes of the buffer, fill it
+            if self.pos >= self.cap {
+                // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
+                let mut stream =
+                    unsafe { TcpStream::from_raw_fd(self.source.borrow().get_raw_fd()) };
+                self.pos = 0;
+                println!("Poll reading");
+                self.cap = match stream.read(self.buf.as_mut_slice()) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        println!("Would block");
+                        if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
+                            let _ = stream.into_raw_fd();
+                            return Poll::Ready(Err(e));
+                        }
+
+                        // Drop the stream without closing the associated file
+                        let _ = stream.into_raw_fd();
+                        return Poll::Pending;
+                    }
+                    ret => {
+                        println!("Ready");
+                        let _ = stream.into_raw_fd();
+                        ret
+                    }
+                }?;
+            }
+            if self.cap == 0 {
+                return Poll::Ready(Ok(None));
+            }
+
+            if let Some(i) = self.buf[self.pos..self.cap]
+                .iter()
+                .position(|b| *b == b'\n')
+            {
+                // Do not take the \n
+                self.next_line
+                    .extend_from_slice(&self.buf[self.pos..(self.pos + i)]);
+                self.pos += i + 1;
+                if let Ok(mut ret) = String::from_utf8(std::mem::take(&mut self.next_line)) {
+                    if ret.ends_with('\r') {
+                        ret.pop();
+                    }
+                    return Poll::Ready(Ok(Some(ret)));
+                } else {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Not utf8",
+                    )));
+                }
+            } else {
+                self.next_line
+                    .extend_from_slice(&self.buf[self.pos..self.cap]);
+                self.pos = self.cap;
+            }
+        }
+    }
+}
+
+struct NextTcpStreamLine<'a> {
+    stream: &'a mut AsyncTcpStream,
+}
+
+impl<'a> Future for NextTcpStreamLine<'a> {
+    type Output = std::io::Result<Option<String>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = Pin::get_mut(self);
+        this.stream.poll_line(cx)
     }
 }
 
 pub struct TcpConnectionAccept {
     source: Rc<RefCell<IoSource>>,
     state: TcpConnectionAcceptState,
-    reactor: Rc<RefCell<Reactor>>,
 }
 
 impl Unpin for TcpConnectionAccept {}
@@ -88,27 +189,16 @@ impl TcpConnectionAccept {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
-        let source = self.source.borrow();
-        let mut currently_waiting_for = source.waiting_for();
-
-        if !currently_waiting_for.readable {
-            println!("Registering interest in readability for TcpListener");
-            let fd = source.borrow_fd();
-            currently_waiting_for.readable = true;
-            self.reactor
-                .borrow_mut()
-                .register_interest(fd, currently_waiting_for)
-                .unwrap();
-            std::mem::drop(source);
-        }
-        self.source.borrow_mut().add_reader(cx.waker().clone());
+        if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
+            return Poll::Ready(Err(e));
+        };
         self.state = TcpConnectionAcceptState::WokenWhenReady;
         Poll::Pending
     }
 
     fn poll_assume_ready(
         &mut self,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
         // SAFETY: The fd of self.source is a valid TCP listener fd.
         let tcp_listener = unsafe { TcpListener::from_raw_fd(self.source.borrow().get_raw_fd()) };
@@ -117,6 +207,7 @@ impl TcpConnectionAccept {
             Ok(ret) => {
                 // Drop the TcpListener without closing the fd.
                 let _ = tcp_listener.into_raw_fd();
+                self.state = TcpConnectionAcceptState::Finished;
                 Poll::Ready(Ok(ret))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

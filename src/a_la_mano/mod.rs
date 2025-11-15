@@ -2,11 +2,11 @@ mod executor;
 mod reactor;
 mod tcp;
 
-use std::{cell::RefCell, rc::Rc};
+use executor::Executor;
 
-async fn run(reactor: Rc<RefCell<reactor::Reactor>>) {
-    let tcp_listener = tcp::AsyncTcpListener::bind("127.0.0.1:8080", reactor.clone())
-        .expect("Failed to bind TCP listener");
+async fn run() {
+    let tcp_listener =
+        tcp::AsyncTcpListener::bind("127.0.0.1:8080").expect("Failed to bind TCP listener");
 
     loop {
         println!("Waiting for incoming TCP connections...");
@@ -16,12 +16,22 @@ async fn run(reactor: Rc<RefCell<reactor::Reactor>>) {
             .expect("Failed to accept TCP connection");
 
         println!("Accepted connection from {:?}", tcp_stream.peer_addr());
+        Executor::spawn(handle_connection(
+            tcp::AsyncTcpStream::from_tcp_stream(tcp_stream).unwrap(),
+        ))
+    }
+}
 
-        // Handle the TCP connection (e.g., read/write data) here.
+async fn handle_connection(mut stream: tcp::AsyncTcpStream) {
+    while let Ok(Some(line)) = stream
+        .get_line()
+        .await
+        .inspect_err(|e| println!("Error while reading line: {e:?}"))
+    {
+        println!("{line}")
     }
 }
 
 pub fn start() {
-    let mut executor = executor::Executor::new();
-    executor.block_on(run(executor.reactor.clone()));
+    Executor::block_on(run());
 }
