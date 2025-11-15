@@ -9,16 +9,18 @@ async fn run() {
         tcp::AsyncTcpListener::bind("127.0.0.1:8080").expect("Failed to bind TCP listener");
 
     loop {
-        println!("Waiting for incoming TCP connections...");
+        eprintln!("Waiting for incoming TCP connections...");
         let (tcp_stream, _addr) = tcp_listener
             .accept()
             .await
             .expect("Failed to accept TCP connection");
 
         println!("Accepted connection from {:?}", tcp_stream.peer_addr());
-        Executor::spawn(handle_connection(
+        if let Err(e) = Executor::spawn(handle_connection(
             tcp::AsyncTcpStream::from_tcp_stream(tcp_stream).unwrap(),
-        ))
+        )) {
+            println!("Failed to spawn task: {e}");
+        }
     }
 }
 

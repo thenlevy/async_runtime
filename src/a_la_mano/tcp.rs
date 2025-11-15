@@ -52,7 +52,7 @@ impl AsyncTcpStream {
 
         let fd = Rc::new(OwnedFd::from(stream));
         let source = Reactor::add_source(fd.clone())?;
-        println!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
+        dbg!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
         Ok(Self {
             _inner: fd,
             source,
@@ -69,16 +69,16 @@ impl AsyncTcpStream {
 
     fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<String>>> {
         loop {
+            eprintln!("Buffer pos: {}, cap: {}", self.pos, self.cap);
             // If we have consumed all the bytes of the buffer, fill it
             if self.pos >= self.cap {
                 // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
                 let mut stream =
                     unsafe { TcpStream::from_raw_fd(self.source.borrow().get_raw_fd()) };
-                self.pos = 0;
-                println!("Poll reading");
+                eprintln!("Poll reading");
                 self.cap = match stream.read(self.buf.as_mut_slice()) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        println!("Would block");
+                        eprintln!("Would block");
                         if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
                             let _ = stream.into_raw_fd();
                             return Poll::Ready(Err(e));
@@ -89,7 +89,8 @@ impl AsyncTcpStream {
                         return Poll::Pending;
                     }
                     ret => {
-                        println!("Ready");
+                        eprintln!("Ready");
+                        self.pos = 0;
                         let _ = stream.into_raw_fd();
                         ret
                     }

@@ -57,9 +57,9 @@ impl Executor {
                 };
             }
 
-            println!("Recieving tasks");
+            eprintln!("Recieving tasks");
             self.task_queue.borrow_mut().receive();
-            println!(
+            eprintln!(
                 "After running tasks, {} tasks remain",
                 self.task_queue.borrow().len()
             );
@@ -81,7 +81,7 @@ impl Executor {
         }
     }
 
-    pub fn spawn<F>(future: F)
+    pub fn spawn<F>(future: F) -> std::io::Result<()>
     where
         F: std::future::Future<Output = ()> + 'static,
     {
@@ -92,7 +92,7 @@ impl Executor {
         });
         this.next_task_id.update(|x| x + 1);
         this.task_queue.borrow().sender().send(task).unwrap();
-        Reactor::notify();
+        Reactor::notify()
     }
 
     pub fn block_on<F>(future: F)
@@ -199,7 +199,7 @@ impl MyWaker {
     }
 
     unsafe fn wake(ptr: *const ()) {
-        println!("Waker is waking a task");
+        eprintln!("Waker is waking a task");
         let waker = unsafe {
             // SAFETY:
             // * `ptr` was created either from MyWaker::new or MyWaker::clone. In both cases,

@@ -61,7 +61,7 @@ impl IoSource {
 
     pub fn add_reader(&mut self, waker: Waker) -> std::io::Result<()> {
         if self.readers.is_empty() {
-            println!("fd: {}, self.readers was empty", self.get_raw_fd());
+            eprintln!("fd: {}, self.readers was empty", self.get_raw_fd());
             let mut event = self.waiting_for();
             event.readable = true;
             Reactor::register_interest(self.borrow_fd(), event)?;
@@ -187,7 +187,7 @@ impl Reactor {
                 for event in events {
                     let epoll_event = EpollEvent::from(*event);
                     let event = Event::from(epoll_event);
-                    println!("got event {event:?}");
+                    eprintln!("got event {event:?}");
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
@@ -206,7 +206,7 @@ impl Reactor {
                 for (fd, interest) in interests {
                     Self::register_interest(fd.as_fd(), interest).unwrap();
                 }
-                println!("Waking {} tasks", wakers.len());
+                eprintln!("Waking {} tasks", wakers.len());
                 for waker in wakers {
                     waker.wake();
                 }
