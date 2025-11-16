@@ -142,10 +142,6 @@ impl<'a> TcpStreamLines<'a> {
         }
     }
 
-    pub fn next(&'a mut self) -> TcpLinesNext<'a> {
-        TcpLinesNext { lines: self }
-    }
-
     pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'a, Fut, F>
     where
         Fut: Future<Output = ()> + Unpin,
@@ -156,19 +152,6 @@ impl<'a> TcpStreamLines<'a> {
             f,
             future: None,
         }
-    }
-}
-
-struct TcpLinesNext<'a> {
-    lines: &'a mut TcpStreamLines<'a>,
-}
-
-impl<'a> Future for TcpLinesNext<'a> {
-    type Output = Option<std::io::Result<String>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = Pin::get_mut(self);
-        this.lines.poll_line(cx)
     }
 }
 
