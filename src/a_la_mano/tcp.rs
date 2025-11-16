@@ -8,7 +8,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     rc::Rc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 pub struct AsyncTcpListener {
@@ -52,8 +52,8 @@ impl AsyncTcpStream {
         Ok(Self { _inner: fd, source })
     }
 
-    pub fn get_line(&self) -> impl Future<Output = std::io::Result<Option<String>>> {
-        NextTcpStreamLine::new(self)
+    pub fn get_lines(&self) -> TcpStreamLines<'_> {
+        TcpStreamLines::new(self)
     }
 
     pub fn write_all(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<()>> {
@@ -61,7 +61,7 @@ impl AsyncTcpStream {
     }
 }
 
-struct NextTcpStreamLine<'a> {
+pub struct TcpStreamLines<'a> {
     inner: BorrowedFd<'a>,
     source: Rc<RefCell<IoSource>>,
     buf: Box<[u8; BUF_SIZE]>,
@@ -70,7 +70,7 @@ struct NextTcpStreamLine<'a> {
     next_line: Vec<u8>,
 }
 
-impl<'a> NextTcpStreamLine<'a> {
+impl<'a> TcpStreamLines<'a> {
     fn new(stream: &'a AsyncTcpStream) -> Self {
         Self {
             inner: stream._inner.as_ref().as_fd(),
@@ -82,7 +82,7 @@ impl<'a> NextTcpStreamLine<'a> {
         }
     }
 
-    fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<String>>> {
+    fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<std::io::Result<String>>> {
         loop {
             eprintln!("Buffer pos: {}, cap: {}", self.pos, self.cap);
             // If we have consumed all the bytes of the buffer, fill it
@@ -96,7 +96,7 @@ impl<'a> NextTcpStreamLine<'a> {
                         eprintln!("Would block");
                         if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
                             let _ = stream.into_raw_fd();
-                            return Poll::Ready(Err(e));
+                            return Poll::Ready(Some(Err(e)));
                         }
 
                         // Drop the stream without closing the associated file
@@ -112,7 +112,7 @@ impl<'a> NextTcpStreamLine<'a> {
                 }?;
             }
             if self.cap == 0 {
-                return Poll::Ready(Ok(None));
+                return Poll::Ready(None);
             }
 
             if let Some(i) = self.buf[self.pos..self.cap]
@@ -127,12 +127,12 @@ impl<'a> NextTcpStreamLine<'a> {
                     if ret.ends_with('\r') {
                         ret.pop();
                     }
-                    return Poll::Ready(Ok(Some(ret)));
+                    return Poll::Ready(Some(Ok(ret)));
                 } else {
-                    return Poll::Ready(Err(std::io::Error::new(
+                    return Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "Not utf8",
-                    )));
+                    ))));
                 }
             } else {
                 self.next_line
@@ -141,14 +141,80 @@ impl<'a> NextTcpStreamLine<'a> {
             }
         }
     }
+
+    pub fn next(&'a mut self) -> TcpLinesNext<'a> {
+        TcpLinesNext { lines: self }
+    }
+
+    pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'a, Fut, F>
+    where
+        Fut: Future<Output = ()> + Unpin,
+        F: FnMut(String) -> Fut,
+    {
+        TcpLinesForEach {
+            lines: self,
+            f,
+            future: None,
+        }
+    }
 }
 
-impl<'a> Future for NextTcpStreamLine<'a> {
-    type Output = std::io::Result<Option<String>>;
+struct TcpLinesNext<'a> {
+    lines: &'a mut TcpStreamLines<'a>,
+}
+
+impl<'a> Future for TcpLinesNext<'a> {
+    type Output = Option<std::io::Result<String>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = Pin::get_mut(self);
-        this.poll_line(cx)
+        this.lines.poll_line(cx)
+    }
+}
+
+pub struct TcpLinesForEach<'a, Fut, F>
+where
+    Fut: Future<Output = ()> + Unpin,
+    F: FnMut(String) -> Fut,
+{
+    lines: TcpStreamLines<'a>,
+    f: F,
+    future: Option<Fut>,
+}
+
+impl<'a, Fut, F> Unpin for TcpLinesForEach<'a, Fut, F>
+where
+    Fut: Future<Output = ()> + Unpin,
+    F: FnMut(String) -> Fut,
+{
+}
+
+impl<'a, Fut, F> Future for TcpLinesForEach<'a, Fut, F>
+where
+    Fut: Future<Output = ()> + Unpin,
+    F: FnMut(String) -> Fut,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = Pin::get_mut(self);
+
+        loop {
+            if let Some(fut) = this.future.as_mut() {
+                ready!(Pin::new(fut).poll(cx));
+                this.future = None;
+            } else if let Some(item) = ready!(this.lines.poll_line(cx)) {
+                if let Ok(line) = item {
+                    this.future = Some((this.f)(line));
+                } else {
+                    println!("Error while reading line: {:?}", item.err());
+                    this.future = None;
+                }
+            } else {
+                break;
+            }
+        }
+        Poll::Ready(())
     }
 }
 

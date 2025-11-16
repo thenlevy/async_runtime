@@ -4,6 +4,8 @@ mod tcp;
 
 use executor::Executor;
 
+use std::rc::Rc;
+
 async fn run() {
     let tcp_listener =
         tcp::AsyncTcpListener::bind("127.0.0.1:8080").expect("Failed to bind TCP listener");
@@ -16,29 +18,35 @@ async fn run() {
             .expect("Failed to accept TCP connection");
 
         println!("Accepted connection from {:?}", tcp_stream.peer_addr());
-        if let Err(e) = Executor::spawn(handle_connection(
+        if let Err(e) = Executor::spawn(handle_connection(Rc::new(
             tcp::AsyncTcpStream::from_tcp_stream(tcp_stream).unwrap(),
-        )) {
+        ))) {
             println!("Failed to spawn task: {e}");
         }
     }
 }
 
-async fn handle_connection(mut stream: tcp::AsyncTcpStream) {
-    while let Ok(Some(mut line)) = stream
-        .get_line()
-        .await
-        .inspect_err(|e| println!("Error while reading line: {e:?}"))
-    {
-        line = format!("{}!!!\n", line.to_uppercase());
-        stream
-            .write_all(line.as_bytes())
-            .await
-            .inspect_err(|e| {
-                println!("Error while writing line back to client: {e:?}");
-            })
-            .ok();
-    }
+async fn handle_connection(stream: Rc<tcp::AsyncTcpStream>) {
+    let mut lines = stream.get_lines();
+
+    stream
+        .get_lines()
+        .for_each({
+            |mut line| {
+                let spawn_handle = Rc::clone(&stream);
+                Box::pin(async move {
+                    line = format!("{}!!!\n", line.to_uppercase());
+                    spawn_handle
+                        .write_all(line.as_bytes())
+                        .await
+                        .inspect_err(|e| {
+                            println!("Error while writing line back to client: {e:?}");
+                        })
+                        .ok();
+                })
+            }
+        })
+        .await;
 }
 
 pub fn start() {
