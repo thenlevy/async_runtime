@@ -69,6 +69,17 @@ impl IoSource {
         self.readers.push(waker);
         Ok(())
     }
+
+    pub fn add_writer(&mut self, waker: Waker) -> std::io::Result<()> {
+        if self.writers.is_empty() {
+            eprintln!("fd: {}, self.writers was empty", self.get_raw_fd());
+            let mut event = self.waiting_for();
+            event.writable = true;
+            Reactor::register_interest(self.borrow_fd(), event)?;
+        }
+        self.writers.push(waker);
+        Ok(())
+    }
 }
 
 impl Reactor {

@@ -2,10 +2,10 @@ use crate::a_la_mano::reactor::{IoSource, Reactor};
 
 use std::{
     cell::RefCell,
-    io::Read,
+    io::{Read, Write},
     marker::Unpin,
     net::{SocketAddr, TcpListener, TcpStream},
-    os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -55,6 +55,10 @@ impl AsyncTcpStream {
     pub fn get_line(&self) -> impl Future<Output = std::io::Result<Option<String>>> {
         NextTcpStreamLine::new(self)
     }
+
+    pub fn write_all(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<()>> {
+        TcpStreamWriteAll::new(self, buf)
+    }
 }
 
 struct NextTcpStreamLine<'a> {
@@ -83,9 +87,9 @@ impl<'a> NextTcpStreamLine<'a> {
             eprintln!("Buffer pos: {}, cap: {}", self.pos, self.cap);
             // If we have consumed all the bytes of the buffer, fill it
             if self.pos >= self.cap {
-                // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
-                let mut stream =
-                    unsafe { TcpStream::from_raw_fd(self.source.borrow().get_raw_fd()) };
+                // SAFETY `self._inner` is open because we own a valid reference to it and is a
+                // valid fd for a TcpStream.
+                let mut stream = unsafe { TcpStream::from_raw_fd(self.inner.as_raw_fd()) };
                 eprintln!("Poll reading");
                 self.cap = match stream.read(self.buf.as_mut_slice()) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -148,6 +152,61 @@ impl<'a> Future for NextTcpStreamLine<'a> {
     }
 }
 
+struct TcpStreamWriteAll<'a, 'b> {
+    inner: BorrowedFd<'a>,
+    buf: &'b [u8],
+    source: Rc<RefCell<IoSource>>,
+}
+
+impl Unpin for TcpStreamWriteAll<'_, '_> {}
+
+impl<'a, 'b> TcpStreamWriteAll<'a, 'b> {
+    fn new(stream: &'a AsyncTcpStream, buf: &'b [u8]) -> Self {
+        Self {
+            inner: stream._inner.as_ref().as_fd(),
+            buf,
+            source: stream.source.clone(),
+        }
+    }
+}
+
+impl<'a, 'b> Future for TcpStreamWriteAll<'a, 'b> {
+    type Output = std::io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = Pin::get_mut(self);
+        // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
+        let mut stream = unsafe { TcpStream::from_raw_fd(this.inner.as_raw_fd()) };
+
+        while !this.buf.is_empty() {
+            match stream.write(this.buf) {
+                Ok(0) => {
+                    let _ = stream.into_raw_fd();
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    )));
+                }
+                Ok(n) => {
+                    this.buf = &this.buf[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let _ = stream.into_raw_fd();
+                    if let Err(e) = this.source.borrow_mut().add_writer(cx.waker().clone()) {
+                        return Poll::Ready(Err(e));
+                    }
+                    return Poll::Pending;
+                }
+                Err(e) => {
+                    let _ = stream.into_raw_fd();
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+        let _ = stream.into_raw_fd();
+        Poll::Ready(Ok(()))
+    }
+}
 pub struct TcpConnectionAccept {
     source: Rc<RefCell<IoSource>>,
     state: TcpConnectionAcceptState,

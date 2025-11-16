@@ -25,12 +25,19 @@ async fn run() {
 }
 
 async fn handle_connection(mut stream: tcp::AsyncTcpStream) {
-    while let Ok(Some(line)) = stream
+    while let Ok(Some(mut line)) = stream
         .get_line()
         .await
         .inspect_err(|e| println!("Error while reading line: {e:?}"))
     {
-        println!("{line}")
+        line = format!("{}!!!\n", line.to_uppercase());
+        stream
+            .write_all(line.as_bytes())
+            .await
+            .inspect_err(|e| {
+                println!("Error while writing line back to client: {e:?}");
+            })
+            .ok();
     }
 }
 
