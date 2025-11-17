@@ -27,6 +27,15 @@ async fn run() {
 }
 
 async fn handle_connection(stream: Rc<tcp::AsyncTcpStream>) {
+    let mut lines = stream.get_lines();
+
+    loop {
+        let mut fut = lines.next();
+        let Some(toto) = fut.await else {
+            break;
+        };
+    }
+
     stream
         .get_lines()
         .for_each({

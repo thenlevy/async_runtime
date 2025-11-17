@@ -70,8 +70,8 @@ pub struct TcpStreamLines<'a> {
     next_line: Vec<u8>,
 }
 
-impl<'a> TcpStreamLines<'a> {
-    fn new(stream: &'a AsyncTcpStream) -> Self {
+impl<'b> TcpStreamLines<'b> {
+    fn new(stream: &'b AsyncTcpStream) -> Self {
         Self {
             inner: stream._inner.as_ref().as_fd(),
             source: stream.source.clone(),
@@ -142,7 +142,11 @@ impl<'a> TcpStreamLines<'a> {
         }
     }
 
-    pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'a, Fut, F>
+    pub fn next<'a>(&'a mut self) -> TcpLinesNext<'a, 'b> {
+        TcpLinesNext { lines: self }
+    }
+
+    pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'b, Fut, F>
     where
         Fut: Future<Output = ()> + Unpin,
         F: FnMut(String) -> Fut,
@@ -170,6 +174,20 @@ where
     Fut: Future<Output = ()> + Unpin,
     F: FnMut(String) -> Fut,
 {
+}
+
+pub struct TcpLinesNext<'a, 'b> {
+    lines: &'a mut TcpStreamLines<'b>,
+}
+
+impl<'a, 'b> Future for TcpLinesNext<'a, 'b> {
+    type Output = Option<std::io::Result<String>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = Pin::get_mut(self);
+
+        this.lines.poll_line(cx)
+    }
 }
 
 impl<'a, Fut, F> Future for TcpLinesForEach<'a, Fut, F>
