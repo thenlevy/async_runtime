@@ -40,15 +40,12 @@ pub struct AsyncTcpStream {
     source: Rc<RefCell<IoSource>>,
 }
 
-impl Unpin for AsyncTcpStream {}
-
 impl AsyncTcpStream {
     pub fn from_tcp_stream(stream: TcpStream) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
 
         let fd = Rc::new(OwnedFd::from(stream));
         let source = Reactor::add_source(fd.clone())?;
-        dbg!("AsyncTcpStream fd: {}", source.borrow().get_raw_fd());
         Ok(Self { _inner: fd, source })
     }
 
@@ -61,8 +58,8 @@ impl AsyncTcpStream {
     }
 }
 
-pub struct TcpStreamLines<'a> {
-    inner: BorrowedFd<'a>,
+pub struct TcpStreamLines<'s> {
+    inner: BorrowedFd<'s>,
     source: Rc<RefCell<IoSource>>,
     buf: Box<[u8; BUF_SIZE]>,
     pos: usize,
@@ -70,8 +67,8 @@ pub struct TcpStreamLines<'a> {
     next_line: Vec<u8>,
 }
 
-impl<'b> TcpStreamLines<'b> {
-    fn new(stream: &'b AsyncTcpStream) -> Self {
+impl<'s> TcpStreamLines<'s> {
+    fn new(stream: &'s AsyncTcpStream) -> Self {
         Self {
             inner: stream._inner.as_ref().as_fd(),
             source: stream.source.clone(),
@@ -84,16 +81,12 @@ impl<'b> TcpStreamLines<'b> {
 
     fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<Option<std::io::Result<String>>> {
         loop {
-            eprintln!("Buffer pos: {}, cap: {}", self.pos, self.cap);
             // If we have consumed all the bytes of the buffer, fill it
             if self.pos >= self.cap {
-                // SAFETY `self._inner` is open because we own a valid reference to it and is a
-                // valid fd for a TcpStream.
+                // SAFETY: `inner` borrows the open `TcpStream` fd for the lifetime of `TcpStreamLines`.
                 let mut stream = unsafe { TcpStream::from_raw_fd(self.inner.as_raw_fd()) };
-                eprintln!("Poll reading");
                 self.cap = match stream.read(self.buf.as_mut_slice()) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        eprintln!("Would block");
                         if let Err(e) = self.source.borrow_mut().add_reader(cx.waker().clone()) {
                             let _ = stream.into_raw_fd();
                             return Poll::Ready(Some(Err(e)));
@@ -104,7 +97,6 @@ impl<'b> TcpStreamLines<'b> {
                         return Poll::Pending;
                     }
                     ret => {
-                        eprintln!("Ready");
                         self.pos = 0;
                         let _ = stream.into_raw_fd();
                         ret
@@ -142,11 +134,12 @@ impl<'b> TcpStreamLines<'b> {
         }
     }
 
-    pub fn next<'a>(&'a mut self) -> TcpLinesNext<'a, 'b> {
+    pub fn next<'a>(&'a mut self) -> TcpLinesNext<'a, 's> {
         TcpLinesNext { lines: self }
     }
 
-    pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'b, Fut, F>
+    #[allow(unused)]
+    pub fn for_each<F, Fut>(self, f: F) -> TcpLinesForEach<'s, Fut, F>
     where
         Fut: Future<Output = ()> + Unpin,
         F: FnMut(String) -> Fut,
@@ -159,6 +152,7 @@ impl<'b> TcpStreamLines<'b> {
     }
 }
 
+#[allow(unused)]
 pub struct TcpLinesForEach<'a, Fut, F>
 where
     Fut: Future<Output = ()> + Unpin,
@@ -176,11 +170,11 @@ where
 {
 }
 
-pub struct TcpLinesNext<'a, 'b> {
-    lines: &'a mut TcpStreamLines<'b>,
+pub struct TcpLinesNext<'a, 's> {
+    lines: &'a mut TcpStreamLines<'s>,
 }
 
-impl<'a, 'b> Future for TcpLinesNext<'a, 'b> {
+impl<'a, 's> Future for TcpLinesNext<'a, 's> {
     type Output = Option<std::io::Result<String>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -219,16 +213,14 @@ where
     }
 }
 
-struct TcpStreamWriteAll<'a, 'b> {
-    inner: BorrowedFd<'a>,
+struct TcpStreamWriteAll<'s, 'b> {
+    inner: BorrowedFd<'s>,
     buf: &'b [u8],
     source: Rc<RefCell<IoSource>>,
 }
 
-impl Unpin for TcpStreamWriteAll<'_, '_> {}
-
-impl<'a, 'b> TcpStreamWriteAll<'a, 'b> {
-    fn new(stream: &'a AsyncTcpStream, buf: &'b [u8]) -> Self {
+impl<'s, 'b> TcpStreamWriteAll<'s, 'b> {
+    fn new(stream: &'s AsyncTcpStream, buf: &'b [u8]) -> Self {
         Self {
             inner: stream._inner.as_ref().as_fd(),
             buf,
@@ -237,12 +229,12 @@ impl<'a, 'b> TcpStreamWriteAll<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Future for TcpStreamWriteAll<'a, 'b> {
+impl<'s, 'b> Future for TcpStreamWriteAll<'s, 'b> {
     type Output = std::io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = Pin::get_mut(self);
-        // SAFETY `self._inner` is open because we own it and is a valid fd for a TcpStream.
+        // SAFETY: `inner` borrows the open `TcpStream` fd for the lifetime of `TcpStreamWriteAll`.
         let mut stream = unsafe { TcpStream::from_raw_fd(this.inner.as_raw_fd()) };
 
         while !this.buf.is_empty() {
@@ -294,8 +286,6 @@ impl TcpConnectionAccept {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<(TcpStream, SocketAddr)>> {
-        println!("Polling TcpConnectionAccept in Start state");
-
         let source = self.source.borrow();
         // SAFETY: The fd of self.source is a valid TCP listener fd.
         let tcp_listener = unsafe { TcpListener::from_raw_fd(source.get_raw_fd()) };
@@ -303,7 +293,6 @@ impl TcpConnectionAccept {
         std::mem::drop(source);
 
         let ret = tcp_listener.accept();
-        println!("First accept attempt returned: {:?}", ret);
         match ret {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.state = TcpConnectionAcceptState::FirstAttemptBlocked;

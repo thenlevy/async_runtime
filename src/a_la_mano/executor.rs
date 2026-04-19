@@ -53,7 +53,7 @@ impl Executor {
                 };
             }
 
-            eprintln!("Recieving tasks");
+            eprintln!("Receiving tasks");
             self.task_queue.borrow_mut().receive();
             eprintln!(
                 "After running tasks, {} tasks remain",
@@ -219,7 +219,7 @@ impl MyWaker {
             &*(ptr as *const MyWaker)
         };
         waker.sender.send(Rc::clone(&waker.task)).unwrap();
-        // In this context, the ressources are borrowed, so we don't decrement the reference count.
+        // In this context, the resources are borrowed, so we don't decrement the reference count.
     }
 
     unsafe fn drop(ptr: *const ()) {

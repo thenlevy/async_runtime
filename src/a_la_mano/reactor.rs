@@ -205,9 +205,9 @@ impl Reactor {
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
-                        // If the event is readable, add all the wakes that are waiting for it to be
+                        // If the event is readable, add all the wakers that are waiting for it to be
                         // readable. If the event is writable, add all the
-                        // wakes that are waiting for it to be writable.
+                        // wakers that are waiting for it to be writable.
                         if event.readable {
                             source.drain_readers_into(&mut wakers);
                         }
