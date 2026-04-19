@@ -167,7 +167,7 @@ impl Reactor {
         Ok(new_source)
     }
 
-    pub fn react() -> std::io::Result<()> {
+    pub fn block_on_event_and_react() -> std::io::Result<()> {
         let this = Self::get();
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
         let mut interests = Vec::new();

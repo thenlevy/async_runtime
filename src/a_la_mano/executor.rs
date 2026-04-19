@@ -38,37 +38,35 @@ impl Executor {
         loop {
             self.task_queue.borrow_mut().receive();
 
-            // Run all tasks that are ready to make progress.
-            println!("Running {} tasks", self.task_queue.borrow().len());
             loop {
-                let task = {
-                    if let Some(task) = self.task_queue.borrow_mut().pop() {
-                        task
-                    } else {
+                // Run all tasks that are ready to make progress.
+                println!("Running {} tasks", self.task_queue.borrow().len());
+                loop {
+                    let Some(task) = self.task_queue.borrow_mut().pop() else {
                         break;
-                    }
-                };
+                    };
 
-                let waker = MyWaker::new(Rc::clone(&task), self.task_queue.borrow().sender());
-                let mut context = Context::from_waker(&waker);
-                match task.future.borrow_mut().as_mut().poll(&mut context) {
-                    std::task::Poll::Ready(_output) => {}
-                    std::task::Poll::Pending => {}
-                };
-            }
+                    let waker = MyWaker::new(Rc::clone(&task), self.task_queue.borrow().sender());
+                    let mut context = Context::from_waker(&waker);
+                    match task.future.borrow_mut().as_mut().poll(&mut context) {
+                        std::task::Poll::Ready(_output) => {}
+                        std::task::Poll::Pending => {}
+                    };
+                }
 
-            eprintln!("Recieving tasks");
-            self.task_queue.borrow_mut().receive();
-            eprintln!(
-                "After running tasks, {} tasks remain",
-                self.task_queue.borrow().len()
-            );
-            if !Reactor::waiting_on_events() && self.task_queue.borrow().is_empty() {
-                break;
+                eprintln!("Recieving tasks");
+                self.task_queue.borrow_mut().receive();
+                eprintln!(
+                    "After running tasks, {} tasks remain",
+                    self.task_queue.borrow().len()
+                );
+                if self.task_queue.borrow().is_empty() {
+                    break;
+                }
             }
 
             if Reactor::waiting_on_events() {
-                match Reactor::react() {
+                match Reactor::block_on_event_and_react() {
                     Ok(()) => {}
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::Interrupted {
@@ -77,6 +75,9 @@ impl Executor {
                         eprintln!("Error while waiting for IO events :{}", e);
                     }
                 }
+            } else {
+                // No task is waiting and no task can be run. We can exit the execution loop
+                break;
             }
         }
     }
