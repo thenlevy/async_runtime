@@ -169,45 +169,26 @@ impl Reactor {
 
     pub fn block_on_event_and_react() -> std::io::Result<()> {
         let this = Self::get();
-        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
 
         // Interests to be re-registered after the one-shot epoll_wait call.
         let mut interests = Vec::new();
 
-        let res = {
-            let nb_events = unsafe {
-                libc::epoll_wait(
-                    this.epoll_fd.as_raw_fd(),
-                    events.as_mut_ptr(),
-                    Self::MAX_EVENT as i32,
-                    -1,
-                )
-            };
-
-            if nb_events == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(nb_events)
-            }
-        };
-        match res {
+        let epoll_res = this.wait_for_events();
+        match epoll_res {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
             Err(e) => Err(e),
-            Ok(nb_events) => {
-                assert!(nb_events >= 0);
+            Ok(events) => {
                 // The wakers to be woken up.
-                let mut wakers = Vec::with_capacity(nb_events as usize);
-                let events = &events[0..nb_events as usize];
+                let mut wakers = Vec::with_capacity(events.len());
                 for event in events {
-                    let epoll_event = EpollEvent::from(*event);
-                    let event = Event::from(epoll_event);
                     eprintln!("got event {event:?}");
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
-                        // If the event is readable, add all the wakers that are waiting for it to be
-                        // readable. If the event is writable, add all the
-                        // wakers that are waiting for it to be writable.
+                        // If the event is readable, add all the wakers that are waiting for it to
+                        // be readable. If the event is writable, add all
+                        // the wakers that are waiting for it to be
+                        // writable.
                         if event.readable {
                             source.drain_readers_into(&mut wakers);
                         }
@@ -231,36 +212,74 @@ impl Reactor {
                     waker.wake();
                 }
 
-                // Clear the spawn notifications
-                {
-                    let notify_event_key = this
-                        .notify_event_key
-                        .expect("notify event key was set at initialisation");
-                    let notify_source = this
-                        .sources
-                        .get(&notify_event_key)
-                        .expect("Notify source was registered at initialisation");
-                    {
-                        use std::{io::Read, os::fd::IntoRawFd};
-                        let mut stream =
-                            unsafe { UnixStream::from_raw_fd(notify_source.borrow().get_raw_fd()) };
-                        stream.set_nonblocking(true)?;
-                        let mut buf = [0; 1024];
-                        while let Ok(_) = stream.read(&mut buf.as_mut_slice()) {}
-                        let _ = stream.into_raw_fd();
-                    }
-                    this.register_interest_inner(
-                        notify_source.borrow().borrow_fd(),
-                        Event {
-                            key: notify_event_key,
-                            readable: true,
-                            writable: false,
-                        },
-                    )?;
-                }
+                this.clear_spawn_notifications()?;
                 Ok(())
             }
         }
+    }
+
+    fn wait_for_events(&self) -> std::io::Result<Vec<Event>> {
+        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
+        let nb_events = {
+            let epoll_result = unsafe {
+                libc::epoll_wait(
+                    self.epoll_fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    Self::MAX_EVENT as i32,
+                    -1,
+                )
+            };
+
+            if epoll_result < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(epoll_result)
+            }
+        }
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                // `epoll_wait` can return EINTR when a signal is delivered before any fd is ready.
+                // That is not a failure of the reactor; we treat it as waking with zero events so
+                // the run loop can retry (or handle signals) without surfacing a spurious error.
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        })?;
+
+        Ok(events
+            .iter()
+            .take(nb_events as usize)
+            .map(|event| Event::from(EpollEvent::from(*event)))
+            .collect())
+    }
+
+    fn clear_spawn_notifications(&mut self) -> std::io::Result<()> {
+        let notify_event_key = self
+            .notify_event_key
+            .expect("notify event key was set at initialisation");
+        let notify_source = self
+            .sources
+            .get(&notify_event_key)
+            .expect("Notify source was registered at initialisation");
+        {
+            use std::{io::Read, os::fd::IntoRawFd};
+            let mut stream =
+                unsafe { UnixStream::from_raw_fd(notify_source.borrow().get_raw_fd()) };
+            stream.set_nonblocking(true)?;
+            let mut buf = [0; 1024];
+            while let Ok(_) = stream.read(&mut buf.as_mut_slice()) {}
+            let _ = stream.into_raw_fd();
+        }
+        self.register_interest_inner(
+            notify_source.borrow().borrow_fd(),
+            Event {
+                key: notify_event_key,
+                readable: true,
+                writable: false,
+            },
+        )?;
+        Ok(())
     }
 
     fn register_interest_inner(&self, fd: BorrowedFd<'_>, interest: Event) -> std::io::Result<()> {
