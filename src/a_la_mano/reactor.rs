@@ -173,49 +173,46 @@ impl Reactor {
         // Interests to be re-registered after the one-shot epoll_wait call.
         let mut interests = Vec::new();
 
-        let epoll_res = this.wait_for_events();
-        match epoll_res {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-            Err(e) => Err(e),
-            Ok(events) => {
-                // The wakers to be woken up.
-                let mut wakers = Vec::with_capacity(events.len());
-                for event in events {
-                    eprintln!("got event {event:?}");
+        let events = this.wait_for_events()?;
+        if events.is_empty() {
+            return Ok(());
+        }
 
-                    if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
-                    {
-                        // If the event is readable, add all the wakers that are waiting for it to
-                        // be readable. If the event is writable, add all
-                        // the wakers that are waiting for it to be
-                        // writable.
-                        if event.readable {
-                            source.drain_readers_into(&mut wakers);
-                        }
-                        if event.writable {
-                            source.drain_writers_into(&mut wakers);
-                        }
-                        let event = source.waiting_for();
+        // The wakers to be woken up.
+        let mut wakers = Vec::with_capacity(events.len());
+        for event in events {
+            eprintln!("got event {event:?}");
 
-                        // If the source is still waiting for further events, we must re-register
-                        // the interest.
-                        if event.readable || event.writable {
-                            interests.push((source.fd.clone(), event));
-                        }
-                    }
+            if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut()) {
+                // If the event is readable, add all the wakers that are waiting for it to
+                // be readable. If the event is writable, add all
+                // the wakers that are waiting for it to be
+                // writable.
+                if event.readable {
+                    source.drain_readers_into(&mut wakers);
                 }
-                for (fd, interest) in interests {
-                    Self::register_interest(fd.as_fd(), interest).unwrap();
+                if event.writable {
+                    source.drain_writers_into(&mut wakers);
                 }
-                eprintln!("Waking {} tasks", wakers.len());
-                for waker in wakers {
-                    waker.wake();
-                }
+                let event = source.waiting_for();
 
-                this.clear_spawn_notifications()?;
-                Ok(())
+                // If the source is still waiting for further events, we must re-register
+                // the interest.
+                if event.readable || event.writable {
+                    interests.push((source.fd.clone(), event));
+                }
             }
         }
+        for (fd, interest) in interests {
+            Self::register_interest(fd.as_fd(), interest).unwrap();
+        }
+        eprintln!("Waking {} tasks", wakers.len());
+        for waker in wakers {
+            waker.wake();
+        }
+
+        this.clear_spawn_notifications()?;
+        Ok(())
     }
 
     fn wait_for_events(&self) -> std::io::Result<Vec<Event>> {

@@ -123,7 +123,7 @@ impl<'s> TcpStreamLines<'s> {
                 } else {
                     return Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "Not utf8",
+                        "invalid UTF-8",
                     ))));
                 }
             } else {
