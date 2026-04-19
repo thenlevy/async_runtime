@@ -170,6 +170,8 @@ impl Reactor {
     pub fn block_on_event_and_react() -> std::io::Result<()> {
         let this = Self::get();
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; Self::MAX_EVENT as usize];
+
+        // Interests to be re-registered after the one-shot epoll_wait call.
         let mut interests = Vec::new();
 
         let res = {
@@ -193,6 +195,7 @@ impl Reactor {
             Err(e) => Err(e),
             Ok(nb_events) => {
                 assert!(nb_events >= 0);
+                // The wakers to be woken up.
                 let mut wakers = Vec::with_capacity(nb_events as usize);
                 let events = &events[0..nb_events as usize];
                 for event in events {
@@ -202,6 +205,9 @@ impl Reactor {
 
                     if let Some(mut source) = this.sources.get(&event.key).map(|rc| rc.borrow_mut())
                     {
+                        // If the event is readable, add all the wakes that are waiting for it to be
+                        // readable. If the event is writable, add all the
+                        // wakes that are waiting for it to be writable.
                         if event.readable {
                             source.drain_readers_into(&mut wakers);
                         }
@@ -209,6 +215,9 @@ impl Reactor {
                             source.drain_writers_into(&mut wakers);
                         }
                         let event = source.waiting_for();
+
+                        // If the source is still waiting for further events, we must re-register
+                        // the interest.
                         if event.readable || event.writable {
                             interests.push((source.fd.clone(), event));
                         }
