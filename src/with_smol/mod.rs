@@ -9,37 +9,46 @@ use {
     std::time::Duration,
 };
 
-struct Server {
-    listener: TcpListener,
-    event_receiver: Receiver<Event>,
-    event_emiter: Sender<Event>,
-}
-
 #[derive(Clone, Copy)]
-enum Event {
+enum GameEndingEvent {
     TimeOut,
     SomeoneWon,
 }
 
+struct Server {
+    /// Accepts incoming TCP connections
+    listener: TcpListener,
+    /// The server task will be informed a game-ending event throught this reciever
+    event_receiver: Receiver<GameEndingEvent>,
+    /// Used to inform other tasks of a game-ending event
+    event_emitter: Sender<GameEndingEvent>,
+}
+
 impl Server {
-    async fn new(addr: &str, game_duration: Duration) -> Self {
-        let listener = TcpListener::bind(addr).await.unwrap();
+    fn new(addr: &str, game_duration: Duration) -> Self {
+        // `smol::net::TcpListener::bind` is an async function. This at this point our program is
+        // not doing anything else we can sipmly block the thread until it resolves.
+        let listener = smol::block_on(TcpListener::bind(addr)).unwrap();
         let (event_emiter, event_receiver) = async_broadcast::broadcast(2);
         let timer_emitter = event_emiter.clone();
         smol::spawn(async move {
             Timer::after(game_duration).await;
-            timer_emitter.broadcast(Event::TimeOut).await.unwrap();
+            timer_emitter
+                .broadcast(GameEndingEvent::TimeOut)
+                .await
+                .unwrap();
         })
         .detach();
         Self {
             listener,
-            event_emiter,
+            event_emitter: event_emiter,
             event_receiver,
         }
     }
 
     async fn run(&mut self) {
         loop {
+            // Wait concurrently for either a game ending event or a new connection
             match futures::future::select(
                 self.event_receiver.recv(),
                 Box::pin(self.listener.accept()),
@@ -52,11 +61,13 @@ impl Server {
                 Either::Right((stream, _)) => {
                     let (reader, writer) =
                         smol::io::split(stream.expect("Failed to accept connection").0);
+
+                    // Create a connection handling task and spawn it
                     let connection = Connection {
                         reader: smol::io::BufReader::new(reader),
                         writer,
                         target: rand::random_range(1..=100),
-                        event_emiter: self.event_emiter.clone(),
+                        event_emitter: self.event_emitter.clone(),
                         event_receiver: self.event_receiver.clone(),
                     };
                     smol::spawn(connection.handle()).detach();
@@ -71,8 +82,10 @@ struct Connection {
     writer: smol::io::WriteHalf<TcpStream>,
     /// The number that the client is trying to guess
     target: usize,
-    event_receiver: Receiver<Event>,
-    event_emiter: Sender<Event>,
+    /// The connection handler is informed of a game-ending event through this reciever
+    event_receiver: Receiver<GameEndingEvent>,
+    /// Used to inform other tasks of a game-ending event
+    event_emitter: Sender<GameEndingEvent>,
 }
 
 impl Connection {
@@ -98,8 +111,8 @@ impl Connection {
                             self.writer.write_all(b"Too high!\n").await.unwrap();
                         } else {
                             self.writer.write_all(b"Correct!\n").await.unwrap();
-                            self.event_emiter
-                                .broadcast(Event::SomeoneWon)
+                            self.event_emitter
+                                .broadcast(GameEndingEvent::SomeoneWon)
                                 .await
                                 .unwrap();
                             break;
@@ -114,13 +127,13 @@ impl Connection {
                 }
                 Either::Right((event, _)) => {
                     match event.unwrap() {
-                        Event::SomeoneWon => {
+                        GameEndingEvent::SomeoneWon => {
                             self.writer
                                 .write_all(b"Game over! Someone else won.\n")
                                 .await
                                 .unwrap();
                         }
-                        Event::TimeOut => {
+                        GameEndingEvent::TimeOut => {
                             self.writer
                                 .write_all(b"Game over! Time's up.\n")
                                 .await
@@ -135,8 +148,6 @@ impl Connection {
 }
 
 pub fn execute() {
-    smol::block_on(async {
-        let mut server = Server::new("127.0.0.1:8080", Duration::from_secs(30)).await;
-        server.run().await;
-    });
+    let mut server = Server::new("127.0.0.1:8080", Duration::from_secs(30));
+    smol::block_on(server.run());
 }
